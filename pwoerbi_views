@@ -1,0 +1,157 @@
+CREATE SCHEMA IF NOT EXISTS pbi;
+
+-- Remove old versions first (in one statement, so dependencies drop together).
+DROP VIEW IF EXISTS pbi.dim_role, pbi.dim_party, pbi.dim_project,
+                    pbi.allocation, pbi.occurrence, pbi.obligation, pbi.v_staff_role;
+
+
+-- ----------------------------------------------------------------------------
+-- VIEW 1: pbi.v_staff_role  (helper, not loaded into Power BI)
+-- ----------------------------------------------------------------------------
+CREATE VIEW pbi.v_staff_role AS
+SELECT
+  party_id,
+  scope_project_id AS project_id,
+  role_type
+FROM (
+  SELECT
+    party_id,
+    scope_project_id,
+    role_type,
+    -- Number the roles for each person+project, newest first; rn = 1 is kept.
+    ROW_NUMBER() OVER (
+      PARTITION BY party_id, scope_project_id
+      ORDER BY valid_from DESC
+    ) AS rn
+  FROM esk_core_v3.v_my_party_role
+  WHERE status = 'Active'
+    AND scope_project_id IS NOT NULL
+) r
+WHERE rn = 1;
+
+
+-- ----------------------------------------------------------------------------
+-- VIEW 2: pbi.obligation  (FACT table: one row per staffing obligation)
+-- Joins:   obligation_set (to get the project and set type),
+--          v_staff_role (to get the role),
+--          total allocated hours per obligation (to work out is_fulfilled).
+-- Added columns:
+--   due_date          due_at converted to a plain date
+--   size_bucket       Small / Medium / Large, based on required hours
+--   size_bucket_sort  1/2/3 so Power BI sorts the buckets in the right order
+--   is_fulfilled      1 if delivered hours reached required x threshold, else 0
+-- ----------------------------------------------------------------------------
+CREATE VIEW pbi.obligation AS
+SELECT
+  o.obligation_id,
+  s.project_id,
+  o.obligor_party_id,
+  r.role_type,
+  o.subtype,
+  o.required_quantity,
+  o.fulfillment_threshold,
+  o.lifecycle_status,
+  o.maturity_status,
+  (o.due_at AT TIME ZONE 'UTC')::DATE AS due_date,
+  CASE WHEN o.required_quantity <= 3 THEN 'Small (≤3h)'
+       WHEN o.required_quantity <= 4 THEN 'Medium (4h)'
+       ELSE 'Large (8h+)' END AS size_bucket,
+  CASE WHEN o.required_quantity <= 3 THEN 1
+       WHEN o.required_quantity <= 4 THEN 2
+       ELSE 3 END AS size_bucket_sort,
+  -- COALESCE turns "no allocation at all" (NULL) into 0 hours delivered.
+  CASE WHEN COALESCE(a.got, 0) >= o.required_quantity * o.fulfillment_threshold
+       THEN 1 ELSE 0 END AS is_fulfilled
+FROM esk_core_v3.v_my_obligation o
+JOIN esk_core_v3.v_my_obligation_set s
+  USING (obligation_set_id)
+LEFT JOIN pbi.v_staff_role r
+  ON r.party_id = o.obligor_party_id
+ AND r.project_id = s.project_id
+-- LEFT JOIN keeps obligations that received nothing 
+LEFT JOIN (
+  SELECT obligation_id, SUM(allocated_quantity) AS got
+  FROM esk_core_v3.v_my_obligation_occurrence
+  GROUP BY obligation_id
+) a USING (obligation_id)
+WHERE s.set_type = 'Staffing'
+  AND o.unit_code = 'Hour';
+
+
+-- ----------------------------------------------------------------------------
+-- VIEW 3: pbi.allocation  (FACT table: one row per hours-allocated-to-obligation)
+-- Added columns:
+--   occurred_date  when the session actually happened
+--   days_late      occurred_date minus due_date (0 = on time, negative = early,
+--                  positive = late)
+-- ----------------------------------------------------------------------------
+CREATE VIEW pbi.allocation AS
+SELECT
+  a.obligation_occurrence_id,
+  a.obligation_id,
+  a.occurrence_id,
+  a.allocated_quantity,
+  (oc.occurred_at AT TIME ZONE 'UTC')::DATE AS occurred_date,
+  (oc.occurred_at AT TIME ZONE 'UTC')::DATE - ob.due_date AS days_late
+FROM esk_core_v3.v_my_obligation_occurrence a
+JOIN pbi.obligation ob
+  USING (obligation_id)
+JOIN esk_core_v3.v_my_occurrence oc
+  USING (occurrence_id)
+WHERE oc.is_void = FALSE;
+
+
+-- ----------------------------------------------------------------------------
+-- VIEW 4: pbi.occurrence  (FACT table: one row per delivered session)
+-- Filters: hours only, not voided.
+-- Joins:   v_staff_role, to attach the role of whoever delivered the session.
+-- ----------------------------------------------------------------------------
+CREATE VIEW pbi.occurrence AS
+SELECT
+  oc.occurrence_id,
+  oc.project_id,
+  oc.actor_party_id,
+  r.role_type,
+  oc.subtype,
+  oc.quantity,
+  (oc.occurred_at AT TIME ZONE 'UTC')::DATE AS occurred_date
+FROM esk_core_v3.v_my_occurrence oc
+LEFT JOIN pbi.v_staff_role r
+  ON r.party_id = oc.actor_party_id
+ AND r.project_id = oc.project_id
+WHERE oc.is_void = FALSE
+  AND oc.unit_code = 'Hour';
+
+
+-- ----------------------------------------------------------------------------
+-- VIEW 5: pbi.dim_project  (DIMENSION: one row per project)
+-- ----------------------------------------------------------------------------
+CREATE VIEW pbi.dim_project AS
+SELECT
+  project_id,
+  project_key,
+  project_name,
+  project_type
+FROM esk_core_v3.v_my_project;
+
+
+-- ----------------------------------------------------------------------------
+-- VIEW 6: pbi.dim_party  (DIMENSION: one row per person or organization)
+-- ----------------------------------------------------------------------------
+CREATE VIEW pbi.dim_party AS
+SELECT
+  party_id,
+  display_name,
+  party_kind
+FROM esk_core_v3.v_my_party;
+
+
+-- ----------------------------------------------------------------------------
+-- VIEW 7: pbi.dim_role  (DIMENSION: one row per role type)
+-- ----------------------------------------------------------------------------
+CREATE VIEW pbi.dim_role AS
+SELECT role_type FROM pbi.obligation WHERE role_type IS NOT NULL
+UNION
+SELECT role_type FROM pbi.occurrence WHERE role_type IS NOT NULL;
+
+

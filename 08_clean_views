@@ -1,0 +1,134 @@
+BEGIN;
+SET search_path = esk_core_v3;
+
+--PARTY--
+
+CREATE OR REPLACE VIEW v_my_party AS
+SELECT
+  party_id,
+  INITCAP(REPLACE(party_kind, '_', ' ')) AS party_kind,
+  INITCAP(REPLACE(organization_form, '_', ' ')) AS organization_form,
+  INITCAP(REPLACE(status, '_', ' ')) AS status,
+  display_name,
+  merged_into_party_id,
+  features,
+  created_at
+FROM party
+WHERE party_id::text NOT LIKE 'a0000000-%';
+
+--PROJECT--
+
+CREATE OR REPLACE VIEW v_my_project AS
+SELECT * 
+FROM project 
+WHERE project_id::text NOT LIKE 'a0000000-%';
+
+--PARTY_ROLE--
+
+-- Deduped AND filtered: DISTINCT ON keeps the lowest party_role_id per
+-- (party_id, role_type, scope_project_id) combination, in case the
+-- underlying table still has the double-load duplicates from before.
+-- This is a safety net for querying -- if you haven't already, still run
+-- an actual DELETE on the base table so the duplicates don't linger forever.
+
+CREATE OR REPLACE VIEW v_my_party_role AS
+SELECT DISTINCT ON (party_id, role_type, scope_project_id)
+  party_role_id,
+  party_id,
+  INITCAP(REPLACE(role_type, '_', ' ')) AS role_type,
+  scope_project_id,
+  scope_product_id,
+  scope_party_id,
+  valid_from,
+  valid_to,
+  INITCAP(REPLACE(status, '_', ' ')) AS status
+FROM party_role
+WHERE party_id::text NOT LIKE 'a0000000-%'
+ORDER BY party_id, role_type, scope_project_id, party_role_id;
+
+--OBLIGATION_SET--
+
+DROP VIEW IF EXISTS v_my_obligation_set CASCADE;
+CREATE VIEW v_my_obligation_set AS
+SELECT
+  obligation_set_id,
+  project_id,
+  set_key,
+  set_name,
+  INITCAP(REPLACE(set_type, '_', ' ')) AS set_type,
+  INITCAP(status) AS status,
+  created_at
+FROM obligation_set
+WHERE obligation_set_id::text NOT LIKE 'a0000000-%';
+
+--OBLIGATION--
+
+CREATE OR REPLACE VIEW v_my_obligation AS
+SELECT 
+  obligation_id,
+  obligation_set_id,
+  obligation_key,
+  revision,
+  supersedes_obligation_id,
+  INITCAP(REPLACE(outcome::text, '_', ' ')) AS outcome,
+  INITCAP(REPLACE(subtype, '_', ' ')) AS subtype,
+  INITCAP(REPLACE(authority, '_', ' ')) AS authority,
+  INITCAP(allocation_model) AS allocation_model, 
+  obligor_party_id,
+  beneficiary_party_id,
+  description,
+  required_quantity,
+  INITCAP(unit_code) AS unit_code, 
+  expected_condition,
+  condition_mode,
+  valid_from,
+  valid_to,
+  due_at,
+  trigger_rule,
+  INITCAP(lifecycle_status) AS lifecycle_status, 
+  INITCAP(maturity_status) AS maturity_status, 
+  fulfillment_threshold, 
+  INITCAP(source_resolution_status) AS source_resolution_status,
+  created_at
+FROM obligation 
+WHERE obligation_id::text NOT LIKE 'a0000000-%';
+
+--OCCURRENCE-- 
+DROP VIEW IF EXISTS v_my_occurrence CASCADE;
+CREATE VIEW v_my_occurrence AS
+SELECT 
+  occurrence_id,
+  project_id,
+  parent_occurrence_id,
+  INITCAP(REPLACE(outcome::text, '_', ' ')) AS outcome,
+  INITCAP(REPLACE(subtype, '_', ' ')) AS subtype,
+  actor_party_id,
+  counterparty_party_id,
+  INITCAP(allocation_model) AS allocation_model, 
+  quantity, 
+  INITCAP(unit_code) AS unit_code, 
+  amount,
+  currency_code,
+  condition_result,
+  occurred_at, 
+  observed_from,
+  observed_to,
+  evidence,
+  source_input_id,
+  INITCAP(REPLACE(source_system, '_', ' ')) AS source_system,
+  source_record_id, 
+  source_event_key,
+  supersedes_occurrence_id,
+  is_void,
+  correction_reason
+FROM occurrence 
+WHERE source_system = 'synthetic_timeslots_import';
+
+--OBLIGATION_OCCURRENCE--
+
+CREATE OR REPLACE VIEW v_my_obligation_occurrence AS
+SELECT oo.* 
+FROM obligation_occurrence oo
+JOIN v_my_obligation o ON o.obligation_id = oo.obligation_id;
+
+COMMIT;
